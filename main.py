@@ -141,18 +141,34 @@ async def analyze(req: AnalyzeRequest):
 class NeuralManifoldWalker(nn.Module):
     def __init__(self, n):
         super().__init__()
-        # Input: 4 geometric state features
-        # Output: 2n values (real and imaginary parts of tangent vector)
+        # Action dimension: 2n (tangent real+imag) + 3 (drift_scale, vol_scale, step_scale)
+        self.action_dim = 2 * n + 3
+        # Output: mean (action_dim) + log_std (action_dim)
         self.net = nn.Sequential(
             nn.Linear(4, 64),
             nn.ReLU(),
             nn.Linear(64, 32),
             nn.ReLU(),
-            nn.Linear(32, 2 * n),
+            nn.Linear(32, 2 * self.action_dim),
         )
 
     def forward(self, x):
-        return self.net(x)
+        raw = self.net(x)
+        mean = raw[:, :self.action_dim]
+        log_std = raw[:, self.action_dim:]
+        # Clamp log_std for numerical stability
+        log_std = torch.clamp(log_std, -3.0, 1.0)
+        return mean, log_std
+
+    def sample(self, x):
+        mean, log_std = self.forward(x)
+        std = torch.exp(log_std)
+        noise = torch.randn_like(mean)
+        action = mean + std * noise
+        # Per-dimension log probability: sum of log N(action_i | mean_i, std_i)
+        log_prob = -0.5 * (((action - mean) / (std + 1e-8)) ** 2 + 2 * log_std + np.log(2 * np.pi))
+        log_prob = log_prob.sum(dim=-1)
+        return action, log_prob
 
 
 def construct_psi_from_prices(price_window):
@@ -171,6 +187,75 @@ def compute_berry_magnitude(psi_window):
         np.conj(psi_window) * np.gradient(dpsi_w)
         - dpsi_w * np.gradient(np.conj(psi_window))
     )))
+
+
+def compute_step_geometry(price_window):
+    """Compute geometric state from a price window for sequential path stepping.
+    Returns dict with all signals needed to feed back into the walker,
+    or None if the window is too small / degenerate.
+    """
+    if len(price_window) < 8:
+        return None
+    pw = np.array(price_window, dtype=np.float64)
+    z = hilbert(pw)
+    norm = np.linalg.norm(z)
+    if norm < 1e-10:
+        return None
+    psi_w = z / norm
+    dpsi_w = np.gradient(psi_w)
+    n_w = len(psi_w)
+
+    # Curvature
+    curvature_w = np.zeros(n_w)
+    for i in range(n_w):
+        dd = np.abs(dpsi_w[i]) ** 2
+        pd = np.conj(psi_w[i]) * dpsi_w[i]
+        curvature_w[i] = abs(dd - abs(pd) ** 2)
+
+    # Risk score
+    risk_score_w = float(np.mean(curvature_w))
+
+    # Crisis prob (smoothed entropy)
+    curvature_smooth = gaussian_filter1d(curvature_w, sigma=1.5)
+    curv_norm = curvature_smooth / (np.sum(curvature_smooth) + 1e-10)
+    entropy = -np.sum(curv_norm * np.log(curv_norm + 1e-10))
+    max_entropy = np.log(n_w)
+    concentration = 1.0 - (entropy / max_entropy)
+    risk_normalized = 1.0 / (1.0 + np.exp(-2.0 * (np.log10(risk_score_w + 1e-10) + 4.5)))
+    crisis_prob_w = float(risk_normalized * concentration)
+
+    # Phase dynamics
+    phase = np.unwrap(np.angle(psi_w))
+    inst_freq_w = np.gradient(phase)
+    freq_accel_w = np.gradient(inst_freq_w)
+    direction = float(np.sign(inst_freq_w[-1]))
+    reversal_risk_w = float(-freq_accel_w[-1] * direction)
+
+    # Berry magnitude
+    berry_mag_w = float(np.mean(np.abs(np.imag(
+        np.conj(dpsi_w) * np.gradient(dpsi_w)
+        - np.outer(np.conj(psi_w), psi_w).diagonal() * np.gradient(dpsi_w)
+    ))))
+
+    # Empirical drift/vol from this window
+    log_rets = np.diff(np.log(pw))
+    emp_drift = float(np.mean(log_rets))
+    emp_vol = float(np.std(log_rets))
+
+    return {
+        "psi": psi_w,
+        "dpsi": dpsi_w,
+        "n": n_w,
+        "curvature": curvature_w,
+        "risk_score": risk_score_w,
+        "crisis_prob": crisis_prob_w,
+        "inst_freq": inst_freq_w,
+        "freq_acceleration": freq_accel_w,
+        "reversal_risk": reversal_risk_w,
+        "berry_magnitude": berry_mag_w,
+        "empirical_drift": emp_drift,
+        "empirical_vol": emp_vol,
+    }
 
 
 @app.post("/analyze-paths")
@@ -195,14 +280,21 @@ async def analyze_paths(req: AnalyzeRequest):
         - np.outer(np.conj(psi), psi).diagonal() * np.gradient(dpsi)
     ))))
 
+    # Empirical drift and vol from actual price returns (financial units)
+    log_returns = np.diff(np.log(prices))
+    empirical_drift = float(np.mean(log_returns))       # daily mean log-return
+    empirical_vol = float(np.std(log_returns))           # daily volatility
+    # Geometric signal modulates direction: inst_freq sign gives trend direction
+    drift_direction = float(np.sign(inst_freq[-1]))
+
     # Step 2 — NeuralManifoldWalker
     walker = NeuralManifoldWalker(n)
     optimizer = torch.optim.Adam(walker.parameters(), lr=0.001)
 
     # Step 4 — RL Monte Carlo loop
-    N_PATHS = 300
+    N_PATHS = 1000
     FORWARD_DAYS = 10
-    WARMUP_STEPS = 50
+    WARMUP_STEPS = 150
 
     geo_features = np.array([
         risk_score / (risk_score + 1e-8),
@@ -212,19 +304,31 @@ async def analyze_paths(req: AnalyzeRequest):
     ], dtype=np.float32)
     geo_tensor = torch.tensor(geo_features, dtype=torch.float32).unsqueeze(0)
 
+    # Kinematic forward projection: Δφ = ω·t + ½·α·t²
+    freq_accel = p["freq_acceleration"]
+    expected_phase_change = inst_freq[-1] * FORWARD_DAYS + 0.5 * freq_accel[-1] * FORWARD_DAYS**2
+    phase_direction = float(np.sign(expected_phase_change))
+
     accepted_paths = []
-    running_reward_mean = 0.0
-    running_reward_count = 0
+    running_berry_mean = 0.0
+    running_berry_var = 0.0
+    running_dir_mean = 0.0
+    running_dir_var = 0.0
+    running_count = 0
 
     for step in range(N_PATHS):
-        # Generate tangent vector from network
-        with torch.set_grad_enabled(True):
-            raw_output = walker(geo_tensor)
+        # Sample action from learned distribution
+        action, log_prob = walker.sample(geo_tensor)
+        action_np = action.detach().numpy().flatten()
 
-        raw_np = raw_output.detach().numpy().flatten()
-        tangent_real = raw_np[:n]
-        tangent_imag = raw_np[n:]
+        tangent_real = action_np[:n]
+        tangent_imag = action_np[n:2*n]
         tangent = tangent_real + 1j * tangent_imag
+
+        # Learned parameter scales via sigmoid/tanh on sampled values
+        drift_scale = float(np.tanh(action_np[2*n]))        # [-1, 1]
+        vol_scale = float(2.0 / (1.0 + np.exp(-action_np[2*n+1])))  # [0, 2]
+        step_scale = float(1.0 / (1.0 + np.exp(-action_np[2*n+2])))  # [0, 1]
 
         # Project tangent onto manifold: remove component parallel to psi
         tangent = tangent - np.dot(psi.conj(), tangent) * psi
@@ -233,37 +337,35 @@ async def analyze_paths(req: AnalyzeRequest):
             continue
         tangent = tangent / tangent_norm
 
-        # During warmup: override with random tangent for exploration
-        if step < WARMUP_STEPS:
-            tangent_random = np.random.randn(n) + 1j * np.random.randn(n)
-            tangent_random = tangent_random - np.dot(psi.conj(), tangent_random) * psi
-            tangent_random = tangent_random / (np.linalg.norm(tangent_random) + 1e-10)
-            tangent = tangent_random
-
         # Generate forward path by walking manifold step by step
         path_prices = list(prices.copy())
         psi_current_step = psi.copy()
         path_berry_magnitudes = []
 
         for day in range(FORWARD_DAYS):
-            # Step size from instantaneous frequency magnitude
-            step_size = float(np.abs(inst_freq[-1])) * np.pi / 4
-            step_size = np.clip(step_size, 0.01, 0.3)
+            # Step size: base from phase velocity, scaled by learned parameter
+            base_step = float(np.abs(inst_freq[-1])) * np.pi / 4
+            step_size = np.clip(base_step * step_scale, 0.01, 0.3)
 
             # Geodesic step on unit sphere
             psi_next = (np.cos(step_size) * psi_current_step
                         + np.sin(step_size) * tangent)
             psi_next = psi_next / np.linalg.norm(psi_next)
 
-            # Recover price from wavefunction
+            # Recover price: empirical drift/vol in financial units
+            # Geometric signal modulates via learned scales
+            # psi_next real part gives manifold-consistent oscillation direction
             price_oscillation = np.real(psi_next)
+            price_oscillation = price_oscillation - np.mean(price_oscillation)  # zero-center
             price_oscillation = price_oscillation / (np.max(np.abs(price_oscillation)) + 1e-10)
+            manifold_signal = float(price_oscillation[-1])
 
-            drift = float(inst_freq[-1])
-            vol = float(np.sqrt(np.mean(curvature)))
-            new_price = path_prices[-1] * np.exp(
-                drift + vol * float(price_oscillation[-1])
-            )
+            # Daily return = learned_drift * empirical_drift + learned_vol * empirical_vol * (manifold + noise)
+            drift = drift_scale * empirical_drift
+            vol = vol_scale * empirical_vol
+            noise = np.random.randn()  # per-step stochasticity
+            daily_return = drift + vol * (manifold_signal + noise)
+            new_price = path_prices[-1] * np.exp(daily_return)
             path_prices.append(new_price)
 
             # Compute Berry magnitude of this step's wavefunction
@@ -276,19 +378,40 @@ async def analyze_paths(req: AnalyzeRequest):
             else:
                 path_berry_magnitudes.append(berry_magnitude_current)
 
-        # REWARD: Berry phase accumulation rate along this path
+        # REWARD: Berry magnitude (volatility) + directional consistency
+        path_return = (path_prices[-1] - path_prices[len(prices)]) / path_prices[len(prices)]
         if len(path_berry_magnitudes) > 0:
             berry_along_path = np.array(path_berry_magnitudes)
             delta_berry = berry_along_path[-1] - berry_magnitude_current
-            reward = float(delta_berry / (berry_magnitude_current + 1e-8))
+            berry_reward = float(delta_berry / (berry_magnitude_current + 1e-8))
         else:
-            reward = 0.0
+            berry_reward = 0.0
+        # Direction reward: paths aligned with predicted geometric flow
+        direction_reward = phase_direction * path_return / (empirical_vol * np.sqrt(FORWARD_DAYS) + 1e-8)
+
+        # Update running stats (Welford's online algorithm)
+        running_count += 1
+        delta_b = berry_reward - running_berry_mean
+        running_berry_mean += delta_b / running_count
+        running_berry_var += delta_b * (berry_reward - running_berry_mean)
+        delta_d = direction_reward - running_dir_mean
+        running_dir_mean += delta_d / running_count
+        running_dir_var += delta_d * (direction_reward - running_dir_mean)
+
+        # Combine as z-scores: unit-free, equal weight by construction
+        berry_std = np.sqrt(running_berry_var / running_count) if running_count > 1 else 1.0
+        dir_std = np.sqrt(running_dir_var / running_count) if running_count > 1 else 1.0
+        berry_z = (berry_reward - running_berry_mean) / (berry_std + 1e-8)
+        direction_z = (direction_reward - running_dir_mean) / (dir_std + 1e-8)
+        # Weight direction by geometry's own directional confidence
+        direction_confidence = float(np.tanh(abs(expected_phase_change)))
+        reward = berry_z + direction_confidence * direction_z
 
         # MH acceptance: path must be geometrically consistent with current psi
         if psi_window is not None:
             overlap = min(np.abs(np.dot(psi.conj(), psi_current_step)), 1.0)
             fs_distance = float(np.arccos(overlap))
-            mh_acceptance = 1.0 if fs_distance < np.pi / 3 else 0.0
+            mh_acceptance = 1.0 if fs_distance < np.pi / 6 else 0.0
         else:
             mh_acceptance = 0.0
 
@@ -297,16 +420,11 @@ async def analyze_paths(req: AnalyzeRequest):
 
         # REINFORCE update after warmup
         if step >= WARMUP_STEPS:
-            running_reward_count += 1
-            running_reward_mean += (reward - running_reward_mean) / running_reward_count
-            advantage = reward - running_reward_mean
+            # reward is already zero-mean (z-scored), so advantage = reward
+            advantage = reward
 
-            raw_output_for_grad = walker(geo_tensor)
-            raw_np_grad = raw_output_for_grad.flatten()
-            tangent_reconstructed = (raw_np_grad[:n].detach().numpy() + 1j * raw_np_grad[n:].detach().numpy())
-            log_prob = torch.log(torch.norm(raw_output_for_grad) + 1e-8)
-
-            loss = -log_prob * advantage
+            # log_prob from sample() has per-dimension gradients
+            loss = -log_prob.squeeze() * advantage
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(walker.parameters(), max_norm=1.0)
@@ -314,12 +432,10 @@ async def analyze_paths(req: AnalyzeRequest):
 
     # Fallback if fewer than 10 paths accepted
     if len(accepted_paths) < 10:
-        drift = float(inst_freq[-1])
-        vol = float(np.sqrt(np.mean(curvature)))
         for _ in range(50):
             path = [float(prices[-1])]
             for _ in range(FORWARD_DAYS):
-                path.append(path[-1] * np.exp(drift + vol * np.random.randn()))
+                path.append(path[-1] * np.exp(empirical_drift + empirical_vol * np.random.randn()))
             accepted_paths.append(path[1:])
 
     # Step 5 — Compute path statistics
