@@ -1,0 +1,6 @@
+venv/
+__pycache__/
+node_modules/
+*.pyc
+.DS_Store
+quantum-wave-trader-main.zip

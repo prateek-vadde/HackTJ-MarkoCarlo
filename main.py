@@ -264,6 +264,11 @@ def compute_step_geometry(price_window):
 
 @app.post("/analyze-paths")
 async def analyze_paths(req: AnalyzeRequest):
+    # Deterministic seed for reproducible MC paths
+    seed = (hash(req.date) + 13) % (2**31)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
     # Step 1 — Run full Phase 1 pipeline, reuse all computed values
     p = run_phase1(req.date)
 
@@ -321,7 +326,7 @@ async def analyze_paths(req: AnalyzeRequest):
     optimizer = torch.optim.Adam(walker.parameters(), lr=0.01)
 
     # Step 4 — RL Monte Carlo loop
-    N_PATHS = 1000
+    N_PATHS = 2000
     FORWARD_DAYS = 10
     WARMUP_STEPS = 150
 
@@ -523,6 +528,23 @@ async def analyze_paths(req: AnalyzeRequest):
     expected_drawdown = float(np.mean(drawdowns))
     worst_case_drawdown = float(np.percentile(drawdowns, 5))
     crisis_path_fraction = float(np.mean(drawdowns < -0.05))
+
+    # --- Combined crisis probability from multiple independent signals ---
+    # Signal 1: Realized volatility regime (sigmoid-mapped, baseline ~1% daily vol)
+    vol_signal = 1.0 / (1.0 + np.exp(-30.0 * (empirical_vol - 0.015)))
+    # Signal 2: VIX term structure (backwardation = options market pricing crisis)
+    vix_signal = max(0.0, (vix_ratio - 0.95) / 0.15) if vix_ratio is not None else 0.0
+    vix_signal = min(vix_signal, 1.0)
+    # Signal 3: MC path crisis fraction (what fraction of simulated paths crash)
+    mc_signal = min(crisis_path_fraction / 0.5, 1.0)  # normalize: 50%+ crisis paths → 1.0
+    # Signal 4: Phase 1 geometric curvature signal
+    geo_signal = crisis_prob  # already 0-1 range
+
+    # Combine: take the max of all signals, then blend with average for smoothing
+    # Max captures "any alarm firing", average dampens false positives
+    max_signal = max(vol_signal, vix_signal, mc_signal, geo_signal)
+    avg_signal = (vol_signal + vix_signal + mc_signal + geo_signal) / 4.0
+    crisis_prob = float(0.6 * max_signal + 0.4 * avg_signal)
 
     last_date = datetime.strptime(dates[-1], "%Y-%m-%d")
     forward_dates = [

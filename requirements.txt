@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+yfinance
+scipy
+numpy
+torch
