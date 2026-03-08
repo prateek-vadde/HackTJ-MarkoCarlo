@@ -292,6 +292,30 @@ async def analyze_paths(req: AnalyzeRequest):
     # Geometric signal modulates direction: inst_freq sign gives trend direction
     drift_direction = float(np.sign(inst_freq[-1]))
 
+    # === FIXED-NODE CONSTRAINT: VIX term structure breaks directional symmetry ===
+    # Analog of fixed-node approximation in fermionic QMC sign problem
+    end_date = datetime.strptime(req.date, "%Y-%m-%d")
+    start_date = end_date - timedelta(days=21)
+    try:
+        vix_data = yf.download("^VIX", start=start_date.strftime("%Y-%m-%d"),
+                                end=end_date.strftime("%Y-%m-%d"))
+        vix3m_data = yf.download("^VIX3M", start=start_date.strftime("%Y-%m-%d"),
+                                  end=end_date.strftime("%Y-%m-%d"))
+        vix_current = float(vix_data["Close"].ffill().values[-1].item()) if len(vix_data) > 0 else None
+        vix3m_current = float(vix3m_data["Close"].ffill().values[-1].item()) if len(vix3m_data) > 0 else None
+    except Exception:
+        vix_current = None
+        vix3m_current = None
+
+    if vix_current is not None and vix3m_current is not None and vix3m_current > 0:
+        vix_ratio = vix_current / vix3m_current
+        vix_backwardation = vix_ratio > 1.0
+        vix_term_structure = "BACKWARDATION" if vix_backwardation else "CONTANGO"
+    else:
+        vix_ratio = 1.0
+        vix_backwardation = False
+        vix_term_structure = "UNAVAILABLE"
+
     # Step 2 — NeuralManifoldWalker
     walker = NeuralManifoldWalker()
     optimizer = torch.optim.Adam(walker.parameters(), lr=0.01)
@@ -410,45 +434,48 @@ async def analyze_paths(req: AnalyzeRequest):
         # Sum log probs across days for trajectory-level REINFORCE
         total_log_prob = torch.stack(path_log_probs).sum()
 
-        # REWARD: Phase 1 validated predictions as targets
-        # reversal_risk predicts forward direction (ρ=-0.755, p<0.001)
-        #   negative ρ means: positive reversal_risk → negative forward return
-        # berry_magnitude predicts forward volatility (ρ=0.773, p<0.001)
-        predicted_direction = float(np.sign(reversal_risk))  # ρ is negative, so same sign = opposite return
-        # Scale berry to vol units: berry/emp_vol ratio is ~0.01, so multiply by ~100
-        predicted_vol_scale = berry_magnitude_current / (empirical_vol + 1e-8)
-
-        path_fwd = path_prices[len(prices):]
-        path_returns = np.diff(np.log(np.array(path_fwd) + 1e-8))
-        path_realized_vol = float(np.std(path_returns)) if len(path_returns) > 1 else 0.0
-        path_realized_direction = float(np.sign(np.sum(path_returns)))
-
-        # Vol reward: berry predicts RELATIVE vol level
-        # High berry/vol ratio → paths should have higher vol, low → lower vol
-        path_vol_scale = path_realized_vol / (empirical_vol + 1e-8)
-        vol_consistency = float(np.exp(-abs(path_vol_scale - predicted_vol_scale) / (predicted_vol_scale + 1e-8)))
-
-        # Direction reward: reversal_risk sign predicts opposite of forward return
-        direction_consistency = 1.0 if path_realized_direction == -predicted_direction else 0.0
-
-        reward = vol_consistency + direction_consistency
+        # REWARD: Berry magnitude consistency (vol prediction)
+        path_return = (path_prices[-1] - path_prices[len(prices)]) / path_prices[len(prices)]
+        if len(path_berry_magnitudes) > 0:
+            berry_along_path = np.array(path_berry_magnitudes)
+            delta_berry = berry_along_path[-1] - berry_magnitude_current
+            berry_reward = float(delta_berry / (berry_magnitude_current + 1e-8))
+        else:
+            berry_reward = 0.0
+        direction_reward = phase_direction * path_return / (empirical_vol * np.sqrt(FORWARD_DAYS) + 1e-8)
 
         # Welford's online z-score normalization
         running_count += 1
-        delta_r = reward - running_berry_mean
-        running_berry_mean += delta_r / running_count
-        running_berry_var += delta_r * (reward - running_berry_mean)
-        reward_std = np.sqrt(running_berry_var / running_count) if running_count > 1 else 1.0
-        reward = (reward - running_berry_mean) / (reward_std + 1e-8)
+        delta_b = berry_reward - running_berry_mean
+        running_berry_mean += delta_b / running_count
+        running_berry_var += delta_b * (berry_reward - running_berry_mean)
+        delta_d = direction_reward - running_dir_mean
+        running_dir_mean += delta_d / running_count
+        running_dir_var += delta_d * (direction_reward - running_dir_mean)
+
+        berry_std = np.sqrt(running_berry_var / running_count) if running_count > 1 else 1.0
+        dir_std = np.sqrt(running_dir_var / running_count) if running_count > 1 else 1.0
+        berry_z = (berry_reward - running_berry_mean) / (berry_std + 1e-8)
+        direction_z = (direction_reward - running_dir_mean) / (dir_std + 1e-8)
+        direction_confidence = float(np.tanh(abs(expected_phase_change)))
+        reward = berry_z + direction_confidence * direction_z
 
         # MH acceptance: final psi must be geometrically close to original
         overlap = min(np.abs(np.dot(psi.conj(), psi_current_step)), 1.0)
         fs_distance = float(np.arccos(overlap))
         mh_acceptance = 1.0 if fs_distance < np.pi / 6 else 0.0
 
+        # FIXED-NODE CONSTRAINT: VIX backwardation restricts to negative return domain
+        path_fwd_arr = np.array(path_prices[len(prices):])
+        path_fwd_return = (path_fwd_arr[-1] - path_fwd_arr[0]) / (path_fwd_arr[0] + 1e-8)
+        if vix_backwardation:
+            node_constraint_satisfied = path_fwd_return < 0
+        else:
+            node_constraint_satisfied = True  # contango = no constraint = symmetric fan
+
         if path_valid:
             all_paths.append(path_prices[len(prices):])
-        if np.random.rand() < mh_acceptance:
+        if np.random.rand() < mh_acceptance and node_constraint_satisfied:
             accepted_paths.append(path_prices[len(prices):])
 
         # REINFORCE update after warmup — uses trajectory-level log prob
@@ -468,22 +495,29 @@ async def analyze_paths(req: AnalyzeRequest):
                 path.append(path[-1] * np.exp(empirical_drift + empirical_vol * np.random.randn()))
             all_paths.append(path[1:])
 
-    # Step 5 — Compute path statistics from ALL generated paths (not MH-filtered)
+    # Step 5 — Compute path statistics
+    # Use accepted_paths (MH + fixed-node filtered) for mean/bands when available
+    # The fixed-node constraint shapes the distribution to match VIX directional signal
     all_paths = np.array(all_paths)
     initial_price = float(prices[-1])
 
-    forward_returns = (all_paths[:, -1] - initial_price) / initial_price
+    if len(accepted_paths) >= 10:
+        stat_paths = np.array(accepted_paths)
+    else:
+        stat_paths = all_paths  # fallback if insufficient accepted
+
+    forward_returns = (stat_paths[:, -1] - initial_price) / initial_price
 
     drawdowns = np.array([
         (np.min(path) - path[0]) / (path[0] + 1e-8)
-        for path in all_paths
+        for path in stat_paths
     ])
 
-    path_divergence = float(np.std(all_paths[:, -1]) / (initial_price + 1e-8))
+    path_divergence = float(np.std(stat_paths[:, -1]) / (initial_price + 1e-8))
 
-    predicted_mean = np.mean(all_paths, axis=0).tolist()
-    predicted_upper = np.percentile(all_paths, 75, axis=0).tolist()
-    predicted_lower = np.percentile(all_paths, 25, axis=0).tolist()
+    predicted_mean = np.mean(stat_paths, axis=0).tolist()
+    predicted_upper = np.percentile(stat_paths, 75, axis=0).tolist()
+    predicted_lower = np.percentile(stat_paths, 25, axis=0).tolist()
     expected_return = float(np.mean(forward_returns))
     return_std = float(np.std(forward_returns))
     expected_drawdown = float(np.mean(drawdowns))
@@ -526,7 +560,7 @@ async def analyze_paths(req: AnalyzeRequest):
         "reversal_risk": reversal_risk,
         # Phase 2 MC path fields
         "forward_dates": forward_dates,
-        "mc_paths": all_paths[:20].tolist(),
+        "mc_paths": stat_paths[:20].tolist(),
         "predicted_mean": predicted_mean,
         "predicted_upper": predicted_upper,
         "predicted_lower": predicted_lower,
@@ -540,4 +574,9 @@ async def analyze_paths(req: AnalyzeRequest):
         "acceptance_rate": acceptance_rate,
         "actual_forward_prices": actual_forward_prices,
         "actual_forward_dates": actual_forward_dates,
+        "vix_current": vix_current,
+        "vix3m_current": vix3m_current,
+        "vix_ratio": float(vix_ratio),
+        "vix_term_structure": vix_term_structure,
+        "fixed_node_active": bool(vix_backwardation),
     }
