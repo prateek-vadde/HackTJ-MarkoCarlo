@@ -141,9 +141,9 @@ async def analyze(req: AnalyzeRequest):
 class NeuralManifoldWalker(nn.Module):
     def __init__(self):
         super().__init__()
-        # 3-dim action: drift_mult, vol_mult, tangent_blend
+        # 2-dim action: drift_mult, vol_mult
         # Inputs: 4 geo features from Phase 1
-        self.action_dim = 3
+        self.action_dim = 2
         self.net = nn.Sequential(
             nn.Linear(4, 32),
             nn.ReLU(),
@@ -151,13 +151,10 @@ class NeuralManifoldWalker(nn.Module):
             nn.ReLU(),
             nn.Linear(16, 2 * self.action_dim),
         )
-        # Default bias: "follow the geometry at 1x empirical scale"
-        # drift_mult=tanh(1.0)≈0.76 (agree with phase direction)
-        # vol_mult=softplus(0.5)≈1.0 (match empirical vol)
-        # blend=sigmoid(0)=0.5 (equal weight dpsi vs phase rotation)
+        # Default bias: drift_mult=tanh(1.0)≈0.76, vol_mult=softplus(0.5)≈1.0
         with torch.no_grad():
-            self.net[-1].bias[:3] = torch.tensor([1.0, 0.5, 0.0])
-            self.net[-1].bias[3:] = torch.tensor([0.0, 0.0, 0.0])
+            self.net[-1].bias[:2] = torch.tensor([1.0, 0.5])
+            self.net[-1].bias[2:] = torch.tensor([0.0, 0.0])
 
     def forward(self, x):
         raw = self.net(x)
@@ -289,8 +286,9 @@ async def analyze_paths(req: AnalyzeRequest):
 
     # Empirical drift and vol from actual price returns (financial units)
     log_returns = np.diff(np.log(prices))
-    empirical_drift = float(np.mean(log_returns[len(log_returns)//2:]))  # recent half only
     empirical_vol = float(np.std(log_returns))           # daily volatility
+
+    empirical_drift = float(np.mean(log_returns[len(log_returns)//2:]))  # recent half only
     # Geometric signal modulates direction: inst_freq sign gives trend direction
     drift_direction = float(np.sign(inst_freq[-1]))
 
@@ -316,6 +314,7 @@ async def analyze_paths(req: AnalyzeRequest):
     expected_phase_change = inst_freq[-1] * FORWARD_DAYS + 0.5 * freq_accel[-1] * FORWARD_DAYS**2
     phase_direction = float(np.sign(expected_phase_change))
 
+    all_paths = []
     accepted_paths = []
     running_berry_mean = 0.0
     running_berry_var = 0.0
@@ -362,38 +361,22 @@ async def analyze_paths(req: AnalyzeRequest):
             path_log_probs.append(log_prob)
             action_np = action.detach().numpy().flatten()
 
-            drift_mult = float(np.tanh(action_np[0]))           # [-1, 1]
-            vol_mult = float(np.log1p(np.exp(action_np[1])))      # softplus: (0, ∞), linear growth
-            tangent_blend = float(1.0 / (1.0 + np.exp(-action_np[2])))  # [0, 1]
+            drift_mult = float(np.tanh(action_np[0]))              # [-1, 1]
+            vol_mult = float(np.log1p(np.exp(action_np[1])))      # softplus: (0, ∞)
 
-            # === TANGENT from geometry, not learned ===
+            # === TANGENT = dpsi (trend continuation), deterministic from geometry ===
             cur_psi = cur_geo["psi"]
             cur_dpsi = cur_geo["dpsi"]
 
-            # Basis 1: dpsi projected to tangent space (trend continuation)
+            # Project dpsi to tangent space of manifold
             dpsi_proj = cur_dpsi - np.dot(cur_psi.conj(), cur_dpsi) * cur_psi
             dpsi_norm = np.linalg.norm(dpsi_proj)
 
-            # Basis 2: i*psi projected to tangent space (phase rotation)
-            phase_rot = 1j * cur_psi
-            phase_rot_proj = phase_rot - np.dot(cur_psi.conj(), phase_rot) * cur_psi
-            phase_rot_norm = np.linalg.norm(phase_rot_proj)
-
-            if dpsi_norm < 1e-10 and phase_rot_norm < 1e-10:
+            if dpsi_norm < 1e-10:
                 path_valid = False
                 break
 
-            if dpsi_norm > 1e-10:
-                dpsi_proj = dpsi_proj / dpsi_norm
-            if phase_rot_norm > 1e-10:
-                phase_rot_proj = phase_rot_proj / phase_rot_norm
-
-            tangent = tangent_blend * dpsi_proj + (1.0 - tangent_blend) * phase_rot_proj
-            tangent_norm = np.linalg.norm(tangent)
-            if tangent_norm < 1e-10:
-                path_valid = False
-                break
-            tangent = tangent / tangent_norm
+            tangent = dpsi_proj / dpsi_norm
 
             # === STEP SIZE = empirical_vol (data-derived scale) ===
             step_size = vol_mult * cur_geo["empirical_vol"]
@@ -402,9 +385,7 @@ async def analyze_paths(req: AnalyzeRequest):
             psi_next = (np.cos(step_size) * cur_psi + np.sin(step_size) * tangent)
             psi_next = psi_next / np.linalg.norm(psi_next)
 
-            # === PRICE from Phase 1 signals, walker-scaled ===
-            # drift ANCHORED to Phase 1 (validated directional signal, not overwritten by path noise)
-            # vol EVOLVES with sequential geometry (captures regime change dynamics)
+            # === PRICE: walker-controlled drift and vol ===
             drift = drift_mult * empirical_drift
             vol = vol_mult * cur_geo["empirical_vol"]
 
@@ -429,37 +410,44 @@ async def analyze_paths(req: AnalyzeRequest):
         # Sum log probs across days for trajectory-level REINFORCE
         total_log_prob = torch.stack(path_log_probs).sum()
 
-        # REWARD: Berry magnitude (volatility) + directional consistency
-        path_return = (path_prices[-1] - path_prices[len(prices)]) / path_prices[len(prices)]
-        if len(path_berry_magnitudes) > 0:
-            berry_along_path = np.array(path_berry_magnitudes)
-            delta_berry = berry_along_path[-1] - berry_magnitude_current
-            berry_reward = float(delta_berry / (berry_magnitude_current + 1e-8))
-        else:
-            berry_reward = 0.0
-        direction_reward = phase_direction * path_return / (empirical_vol * np.sqrt(FORWARD_DAYS) + 1e-8)
+        # REWARD: Phase 1 validated predictions as targets
+        # reversal_risk predicts forward direction (ρ=-0.755, p<0.001)
+        #   negative ρ means: positive reversal_risk → negative forward return
+        # berry_magnitude predicts forward volatility (ρ=0.773, p<0.001)
+        predicted_direction = float(np.sign(reversal_risk))  # ρ is negative, so same sign = opposite return
+        # Scale berry to vol units: berry/emp_vol ratio is ~0.01, so multiply by ~100
+        predicted_vol_scale = berry_magnitude_current / (empirical_vol + 1e-8)
 
-        # Welford's online algorithm for z-score normalization
+        path_fwd = path_prices[len(prices):]
+        path_returns = np.diff(np.log(np.array(path_fwd) + 1e-8))
+        path_realized_vol = float(np.std(path_returns)) if len(path_returns) > 1 else 0.0
+        path_realized_direction = float(np.sign(np.sum(path_returns)))
+
+        # Vol reward: berry predicts RELATIVE vol level
+        # High berry/vol ratio → paths should have higher vol, low → lower vol
+        path_vol_scale = path_realized_vol / (empirical_vol + 1e-8)
+        vol_consistency = float(np.exp(-abs(path_vol_scale - predicted_vol_scale) / (predicted_vol_scale + 1e-8)))
+
+        # Direction reward: reversal_risk sign predicts opposite of forward return
+        direction_consistency = 1.0 if path_realized_direction == -predicted_direction else 0.0
+
+        reward = vol_consistency + direction_consistency
+
+        # Welford's online z-score normalization
         running_count += 1
-        delta_b = berry_reward - running_berry_mean
-        running_berry_mean += delta_b / running_count
-        running_berry_var += delta_b * (berry_reward - running_berry_mean)
-        delta_d = direction_reward - running_dir_mean
-        running_dir_mean += delta_d / running_count
-        running_dir_var += delta_d * (direction_reward - running_dir_mean)
-
-        berry_std = np.sqrt(running_berry_var / running_count) if running_count > 1 else 1.0
-        dir_std = np.sqrt(running_dir_var / running_count) if running_count > 1 else 1.0
-        berry_z = (berry_reward - running_berry_mean) / (berry_std + 1e-8)
-        direction_z = (direction_reward - running_dir_mean) / (dir_std + 1e-8)
-        direction_confidence = float(np.tanh(abs(expected_phase_change)))
-        reward = berry_z + direction_confidence * direction_z
+        delta_r = reward - running_berry_mean
+        running_berry_mean += delta_r / running_count
+        running_berry_var += delta_r * (reward - running_berry_mean)
+        reward_std = np.sqrt(running_berry_var / running_count) if running_count > 1 else 1.0
+        reward = (reward - running_berry_mean) / (reward_std + 1e-8)
 
         # MH acceptance: final psi must be geometrically close to original
         overlap = min(np.abs(np.dot(psi.conj(), psi_current_step)), 1.0)
         fs_distance = float(np.arccos(overlap))
         mh_acceptance = 1.0 if fs_distance < np.pi / 6 else 0.0
 
+        if path_valid:
+            all_paths.append(path_prices[len(prices):])
         if np.random.rand() < mh_acceptance:
             accepted_paths.append(path_prices[len(prices):])
 
@@ -472,30 +460,30 @@ async def analyze_paths(req: AnalyzeRequest):
             torch.nn.utils.clip_grad_norm_(walker.parameters(), max_norm=1.0)
             optimizer.step()
 
-    # Fallback if fewer than 10 paths accepted
-    if len(accepted_paths) < 10:
+    # Fallback if fewer than 10 paths generated
+    if len(all_paths) < 10:
         for _ in range(50):
             path = [float(prices[-1])]
             for _ in range(FORWARD_DAYS):
                 path.append(path[-1] * np.exp(empirical_drift + empirical_vol * np.random.randn()))
-            accepted_paths.append(path[1:])
+            all_paths.append(path[1:])
 
-    # Step 5 — Compute path statistics
-    accepted_paths = np.array(accepted_paths)
+    # Step 5 — Compute path statistics from ALL generated paths (not MH-filtered)
+    all_paths = np.array(all_paths)
     initial_price = float(prices[-1])
 
-    forward_returns = (accepted_paths[:, -1] - initial_price) / initial_price
+    forward_returns = (all_paths[:, -1] - initial_price) / initial_price
 
     drawdowns = np.array([
         (np.min(path) - path[0]) / (path[0] + 1e-8)
-        for path in accepted_paths
+        for path in all_paths
     ])
 
-    path_divergence = float(np.std(accepted_paths[:, -1]) / (initial_price + 1e-8))
+    path_divergence = float(np.std(all_paths[:, -1]) / (initial_price + 1e-8))
 
-    predicted_mean = np.mean(accepted_paths, axis=0).tolist()
-    predicted_upper = np.percentile(accepted_paths, 75, axis=0).tolist()
-    predicted_lower = np.percentile(accepted_paths, 25, axis=0).tolist()
+    predicted_mean = np.mean(all_paths, axis=0).tolist()
+    predicted_upper = np.percentile(all_paths, 75, axis=0).tolist()
+    predicted_lower = np.percentile(all_paths, 25, axis=0).tolist()
     expected_return = float(np.mean(forward_returns))
     return_std = float(np.std(forward_returns))
     expected_drawdown = float(np.mean(drawdowns))
@@ -509,6 +497,20 @@ async def analyze_paths(req: AnalyzeRequest):
     ]
 
     acceptance_rate = float(len(accepted_paths) / N_PATHS)
+
+    # Fetch actual forward prices (ground truth) for comparison
+    actual_forward_end = last_date + timedelta(days=20)
+    df_fwd = yf.download("SPY", start=last_date.strftime("%Y-%m-%d"),
+                          end=actual_forward_end.strftime("%Y-%m-%d"))
+    if not df_fwd.empty and len(df_fwd) > 1:
+        fwd_prices = df_fwd["Close"].values.astype(np.float64).flatten()
+        fwd_dates_actual = [d.strftime("%Y-%m-%d") for d in df_fwd.index]
+        # Prepend last observed price so the line connects seamlessly
+        actual_forward_prices = [float(prices[-1])] + fwd_prices[1:FORWARD_DAYS+1].tolist()
+        actual_forward_dates = [dates[-1]] + fwd_dates_actual[1:FORWARD_DAYS+1]
+    else:
+        actual_forward_prices = []
+        actual_forward_dates = []
 
     # Step 6 — Return
     return {
@@ -524,7 +526,7 @@ async def analyze_paths(req: AnalyzeRequest):
         "reversal_risk": reversal_risk,
         # Phase 2 MC path fields
         "forward_dates": forward_dates,
-        "mc_paths": accepted_paths[:20].tolist(),
+        "mc_paths": all_paths[:20].tolist(),
         "predicted_mean": predicted_mean,
         "predicted_upper": predicted_upper,
         "predicted_lower": predicted_lower,
@@ -536,4 +538,6 @@ async def analyze_paths(req: AnalyzeRequest):
         "path_divergence": path_divergence,
         "n_accepted_paths": len(accepted_paths),
         "acceptance_rate": acceptance_rate,
+        "actual_forward_prices": actual_forward_prices,
+        "actual_forward_dates": actual_forward_dates,
     }
